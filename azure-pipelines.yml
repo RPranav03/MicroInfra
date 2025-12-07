@@ -1,0 +1,163 @@
+trigger: none
+
+pr: none
+
+variables:
+  TF_VERSION: '1.5.9'          # adjust as needed
+  TFE_PLUGIN_CACHE_DIR: '/tmp/.terraform.d/plugin-cache'
+
+stages:
+  - stage: InitValidate
+    displayName: 'Init & Validate'
+    jobs:
+      - job: InitValidateJob
+        displayName: 'Terraform Init & Validate'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - script: |
+              set -e
+              echo "Installing Terraform ${TF_VERSION}..."
+              curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o terraform.zip
+              unzip terraform.zip -d /usr/local/bin
+              chmod +x /usr/local/bin/terraform
+              terraform -version
+            displayName: 'Install Terraform'
+
+          - script: |
+              # login using service principal variables (make sure these are set in pipeline/variable group)
+              if [ -n "${ARM_CLIENT_ID}" ] && [ -n "${ARM_CLIENT_SECRET}" ]; then
+                echo 'Logging in with provided Service Principal variables...'
+                az login --service-principal -u "${ARM_CLIENT_ID}" -p "${ARM_CLIENT_SECRET}" --tenant "${ARM_TENANT_ID}" >/dev/null
+              else
+                echo 'No SP creds provided in variables. Ensure pipeline has access to Azure via service connection or set ARM_* variables.'
+              fi
+            displayName: 'Azure CLI Login'
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+          - script: |
+              set -e
+              echo "Running terraform init..."
+              terraform init -input=false
+            displayName: 'Terraform Init'
+
+          - script: |
+              set -e
+              echo "Running terraform fmt check..."
+              terraform fmt -check -recursive
+              echo "Running terraform validate..."
+              terraform validate
+            displayName: 'Terraform Fmt + Validate'
+
+  - stage: ScanningAndManual
+    displayName: 'Scanning (tfsec/checkov) + Manual Approval'
+    dependsOn: InitValidate
+    jobs:
+      - job: Scanning
+        displayName: 'Security & Policy Scans'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - script: |
+              set -e
+              echo "Installing tfsec..."
+              curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              tfsec --version || true
+
+              echo "Installing checkov..."
+              python3 -m pip install --upgrade pip
+              python3 -m pip install checkov
+              checkov --version || true
+            displayName: 'Install tfsec & checkov'
+
+          - script: |
+              set -e
+              echo "Running tfsec scan..."
+              tfsec --format sarif --out tfsec.sarif . || true
+              echo "Running checkov scan..."
+              checkov -d . --output json --output-file-path checkov_report.json || true
+
+              mkdir -p $(Build.ArtifactStagingDirectory)/scan-reports
+              cp tfsec.sarif $(Build.ArtifactStagingDirectory)/scan-reports/ || true
+              cp checkov_report.json $(Build.ArtifactStagingDirectory)/scan-reports/ || true
+            displayName: 'Run tfsec & checkov'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/scan-reports'
+              ArtifactName: 'scan-reports'
+              publishLocation: 'Container'
+            displayName: 'Publish scan reports'
+
+      - job: ManualApproval
+        displayName: 'Manual Approval Before Apply'
+        dependsOn: Scanning
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: ''
+              instructions: 'Review scan reports (published artifact) and resources to be created. Approve to continue to Apply stage.'
+            displayName: 'Manual approval (Gate)'
+
+  - stage: Apply
+    displayName: 'Apply'
+    dependsOn: ScanningAndManual
+    condition: and(succeeded(), eq(dependencies.ScanningAndManual.ManualApproval.result, 'Succeeded'))
+    jobs:
+      - job: ApplyJob
+        displayName: 'Terraform Plan & Apply'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - script: |
+              set -e
+              echo "Installing Terraform ${TF_VERSION}..."
+              curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o terraform.zip
+              unzip terraform.zip -d /usr/local/bin
+              chmod +x /usr/local/bin/terraform
+              terraform -version
+            displayName: 'Install Terraform'
+
+          - script: |
+              set -e
+              echo 'Re-initializing Terraform (ensure backend credentials are available)...'
+              terraform init -input=false
+            displayName: 'Terraform Init (apply)'
+
+          - script: |
+              set -e
+              echo 'Running terraform plan...'
+              terraform plan -out=tfplan -input=false
+              terraform show -json tfplan > tfplan.json
+              mkdir -p $(Build.ArtifactStagingDirectory)/plan
+              cp tfplan.json $(Build.ArtifactStagingDirectory)/plan/
+            displayName: 'Terraform Plan (produce JSON plan)'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/plan'
+              ArtifactName: 'tfplan'
+              publishLocation: 'Container'
+            displayName: 'Publish plan'
+
+          - script: |
+              set -e
+              echo "Applying Terraform plan..."
+              terraform apply -input=false -auto-approve tfplan
+            displayName: 'Terraform Apply'
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)

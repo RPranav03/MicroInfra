@@ -1,0 +1,31 @@
+output "workspace_id" {
+  description = "ID of the Log Analytics Workspace"
+  value       = azurerm_log_analytics_workspace.main.id
+}
+
+output "workspace_name" {
+  description = "Name of the Log Analytics Workspace"
+  value       = azurerm_log_analytics_workspace.main.name
+}
+
+output "workspace_resource_id" {
+  description = "Resource ID of the workspace"
+  value       = azurerm_log_analytics_workspace.main.id
+}
+
+output "primary_shared_key" {
+  description = "Primary shared key for the workspace"
+  value       = azurerm_log_analytics_workspace.main.primary_shared_key
+  sensitive   = true
+}
+
+output "secondary_shared_key" {
+  description = "Secondary shared key for the workspace"
+  value       = azurerm_log_analytics_workspace.main.secondary_shared_key
+  sensitive   = true
+}
+
+output "workspace_customer_id" {
+  description = "Customer ID of the workspace"
+  value       = azurerm_log_analytics_workspace.main.workspace_id
+}
